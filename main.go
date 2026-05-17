@@ -72,17 +72,178 @@ type LangStats struct {
 	Files, Code, Blank, Total int
 }
 
-// ── config parsed from args ──────────────────────────────────────────────────
+// ── .gitignore support ────────────────────────────────────────────────────────
+
+// gitignorePattern holds one parsed pattern from a .gitignore file.
+type gitignorePattern struct {
+	raw      string // original text for display
+	negative bool   // lines starting with !
+	dirOnly  bool   // lines ending with /
+	rooted   bool   // lines containing / (other than trailing)
+	segments []string
+}
+
+// parseGitignore reads a .gitignore file and returns compiled patterns.
+// baseDir is the directory that contains the .gitignore (used for rooted matches).
+func parseGitignore(path string) []gitignorePattern {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var pats []gitignorePattern
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		// strip inline comments
+		if i := strings.Index(line, " #"); i >= 0 {
+			line = line[:i]
+		}
+		line = strings.TrimRight(line, " \t")
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		p := gitignorePattern{raw: line}
+
+		if strings.HasPrefix(line, "!") {
+			p.negative = true
+			line = line[1:]
+		}
+		if strings.HasSuffix(line, "/") {
+			p.dirOnly = true
+			line = strings.TrimSuffix(line, "/")
+		}
+		// rooted = slash appears anywhere except at the very end (already stripped)
+		// or at the very start
+		withoutLeadSlash := strings.TrimPrefix(line, "/")
+		if strings.Contains(withoutLeadSlash, "/") || strings.HasPrefix(line, "/") {
+			p.rooted = true
+		}
+		line = strings.TrimPrefix(line, "/")
+		p.segments = strings.Split(line, "/")
+		pats = append(pats, p)
+	}
+	return pats
+}
+
+// matchesGitignore checks whether relPath (relative to the .gitignore's dir,
+// using forward slashes) is ignored by the given patterns.
+// isDir should be true when checking a directory entry.
+func matchesGitignore(pats []gitignorePattern, relPath string, isDir bool) bool {
+	ignored := false
+	parts := strings.Split(filepath.ToSlash(relPath), "/")
+
+	for _, p := range pats {
+		if p.dirOnly && !isDir {
+			continue
+		}
+		var matched bool
+		if p.rooted {
+			// must match from the root
+			matched = matchSegments(p.segments, parts)
+		} else {
+			// can match any suffix
+			matched = matchAnySuffix(p.segments, parts)
+		}
+		if matched {
+			if p.negative {
+				ignored = false
+			} else {
+				ignored = true
+			}
+		}
+	}
+	return ignored
+}
+
+// matchSegments matches pattern segments against path parts from the start.
+func matchSegments(pat, parts []string) bool {
+	if len(pat) == 0 {
+		return true
+	}
+	if len(pat) > len(parts) {
+		return false
+	}
+	for i, seg := range pat {
+		ok, _ := filepath.Match(seg, parts[i])
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// matchAnySuffix tries matchSegments at every starting position.
+func matchAnySuffix(pat, parts []string) bool {
+	for start := 0; start <= len(parts)-len(pat); start++ {
+		if matchSegments(pat, parts[start:]) {
+			return true
+		}
+	}
+	return false
+}
+
+// gitignoreCache maps a directory path to its parsed patterns.
+// We load the .gitignore for each directory we enter.
+type gitignoreCache struct {
+	root string
+	data map[string][]gitignorePattern
+}
+
+func newGitignoreCache(root string) *gitignoreCache {
+	return &gitignoreCache{root: root, data: map[string][]gitignorePattern{}}
+}
+
+func (gc *gitignoreCache) load(dir string) []gitignorePattern {
+	if pats, ok := gc.data[dir]; ok {
+		return pats
+	}
+	pats := parseGitignore(filepath.Join(dir, ".gitignore"))
+	gc.data[dir] = pats
+	return pats
+}
+
+// isIgnored checks whether a path is ignored by any .gitignore from root down to its parent.
+func (gc *gitignoreCache) isIgnored(absPath string, isDir bool) bool {
+	rel, err := filepath.Rel(gc.root, absPath)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+
+	// Walk from root down, checking each ancestor's .gitignore against the remaining relative path.
+	cur := gc.root
+	for i, part := range parts {
+		_ = part
+		pats := gc.load(cur)
+		if len(pats) > 0 {
+			suffix := strings.Join(parts[i:], "/")
+			entryIsDir := isDir || i < len(parts)-1
+			if matchesGitignore(pats, suffix, entryIsDir) {
+				return true
+			}
+		}
+		if i < len(parts)-1 {
+			cur = filepath.Join(cur, parts[i])
+		}
+	}
+	return false
+}
+
+// ── config ────────────────────────────────────────────────────────────────────
 
 type config struct {
-	root      string
-	topN      int
-	lang      string
-	dirs      bool
-	langs     bool
-	all       bool
-	noColor   bool
-	listLangs bool
+	root        string
+	topN        int
+	lang        string
+	dirs        bool
+	langs       bool
+	all         bool
+	noColor     bool
+	listLangs   bool
+	noGitignore bool
 }
 
 func parseArgs() config {
@@ -101,6 +262,8 @@ func parseArgs() config {
 			cfg.noColor = true
 		case a == "--list-langs":
 			cfg.listLangs = true
+		case a == "--no-gitignore":
+			cfg.noGitignore = true
 		case a == "--help" || a == "-h":
 			printHelp()
 			os.Exit(0)
@@ -133,6 +296,7 @@ Flags:
   --dirs, -d         show directory-level stats
   --langs            show language breakdown only
   --all, -a          show files + dirs + language breakdown
+  --no-gitignore     include files that .gitignore would exclude
   --no-color         disable colour output (auto-disabled when piping)
   --list-langs       list all supported languages and exit
   --help, -h         show this help
@@ -143,6 +307,7 @@ Examples:
   loc . --dirs                 directory-level breakdown
   loc . --lang Go              only Go files
   loc . --all                  files + dirs + language summary
+  loc . --no-gitignore         ignore .gitignore rules
   loc . --no-color             plain output, safe for piping
   loc . --list-langs           list all 33 supported languages
 `)
@@ -217,9 +382,15 @@ func countLines(path string) (total, code, blank int) {
 	return
 }
 
-func collect(root, langFilter string) []FileStats {
+func collect(root, langFilter string, noGitignore bool) []FileStats {
 	var files []FileStats
 	root, _ = filepath.Abs(root)
+
+	var gi *gitignoreCache
+	if !noGitignore {
+		gi = newGitignoreCache(root)
+	}
+
 	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -229,12 +400,21 @@ func collect(root, langFilter string) []FileStats {
 			if skipDirs[n] || strings.HasPrefix(n, ".") {
 				return filepath.SkipDir
 			}
+			if gi != nil && gi.isIgnored(path, true) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
+
+		// Check gitignore for files
+		if gi != nil && gi.isIgnored(path, false) {
+			return nil
+		}
+
 		ext := filepath.Ext(d.Name())
 		lang, ok := extToLang[strings.ToLower(ext)]
 		if !ok {
-			lang, ok = extToLang[ext] // preserve case e.g. .R
+			lang, ok = extToLang[ext]
 		}
 		if !ok {
 			return nil
@@ -453,7 +633,7 @@ func main() {
 	}
 
 	fmt.Printf(dim("  Scanning %s …\r"), cfg.root)
-	files := collect(cfg.root, cfg.lang)
+	files := collect(cfg.root, cfg.lang, cfg.noGitignore)
 	fmt.Print(strings.Repeat(" ", 50) + "\r")
 
 	if len(files) == 0 {
